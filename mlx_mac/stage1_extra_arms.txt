@@ -1,0 +1,27 @@
+# Added 2026-10-31 07:35 from the activation-research catalogue (analysis/papers_2026-10-31/EML_ACTIVATION_RESEARCH.md)
+xielu              # fixed: trainable per-layer alpha from 0.8/0.8, beta 0.5 (was 1.17/1.67 fixed); unpacked 4d like ReLU^2
+eglu_r2n           # gate (e^tanh u - 1/e)/(e - 1/e) in (0,1) * relu(v)^2: can close, never exceeds relu(v)^2 (FP8-safe)
+relu2glu           # relu(u)^2 * v: calibrator, does the exp gate matter?
+eml_mul            # H1 diagnostic: e^tanh u * log1p(relu v), the proposal's branches multiplied instead of subtracted
+eglu_r2+subnorm    # RMSNorm of the gated vector before c_proj (H4; bounded rows for a static FP8 scale)
+# Added 07:45: the proposal's untested dual-space items (the 2b/3 grids that held them were stopped)
+eml_metal+emlskip@opt=muon_split@lr1.25   # the proposal's full recipe: EML gate + EML skips + split u/v orthogonalization + LR x1.25
+eml_metal@lr1.25                          # item: LR x1.25 alone
+eml_metal@opt=muon_split                  # item: dual-branch (u/v) orthogonalization alone
+eml_metal+emlskip                         # item: log-space multiplicative skip alone
+relu2_metal+emlskip                       # EML skip on the baseline (independent of the gate; #393's MUDD/skip analogue)
+eglu_r2@opt=muon_split                    # split orthogonalization on the best EML gate (where it can matter)
+eglu_r2+emlskip@opt=muon_split            # "EML throughout" on the gated form
+# Added 08:00: the EML skip with its defect fixed (softplus damping branch, never dead), plus per-token versions
+relu2_metal+emlskip2                      # fixed scalar EML skip on the baseline (pairs with relu2_metal+emlskip)
+eml_metal+emlskip2                        # fixed scalar EML skip on the EML MLP (pairs with eml_metal+emlskip)
+eml_metal+emlskip2@opt=muon_split@lr1.25  # the proposal's full recipe with the fixed skip
+relu2_metal+emltok                        # per-token EML residual gates from 8 leading channels ("amplify and damp outliers")
+relu2_metal+sigtok                        # control: per-token 2*sigmoid residual gates from the same channels
+lrelu2                                    # LeakyReLU(0.5)^2, the parameter-golf records' activation (added 08:25)
+# Added 09:58: LeakyReLU slope sweep for the #393 record attempt (0.5 = parameter golf's choice)
+lrelu2_a25                                # LeakyReLU(0.25)^2
+lrelu2_a75                                # LeakyReLU(0.75)^2
+# Added 10:35: signed leaky square (post carries the sign: no mask in #393's fused FP8 kernel)
+ssq_a50                                   # x^2 (x>0), -(0.5x)^2 (x<0)
+ssq_a25                                   # x^2 (x>0), -(0.25x)^2 (x<0)
