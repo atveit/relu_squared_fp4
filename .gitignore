@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# study data (downloaded FineWeb shards) and local venvs
+data/
+.venv-*/
+colab_bundle.zip
