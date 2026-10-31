@@ -2,6 +2,8 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/atveit/relu_squared_fp4/blob/main/jax_tpu/colab_tpu.ipynb) (TPU v5e / v6e notebook)
 
+![relu_squared_fp4: is ReLU² why FP4 training works? Activations × number formats, a controlled study on MLX, JAX/TPU and PyTorch/B300](assets/relu_squared_fp4_blogpost_image.jpg)
+
 **Is ReLU² why FP4 training works?** This is a small, controlled study of how the MLP activation interacts with the number format in low-precision LLM training.
 
 > ⚠️ **Work in progress.** The Mac (MLX, simulated formats) results are in. The TPU (Colab) and B300 (real NVFP4) runs are pending, and the JAX and PyTorch trainers are still being smoke-tested.
