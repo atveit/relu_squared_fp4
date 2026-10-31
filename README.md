@@ -6,6 +6,8 @@
 
 **Is ReLU² why FP4 training works?** This is a small, controlled study of how the MLP activation interacts with the number format in low-precision LLM training.
 
+> ⚠️ **Learning-rate bug in the Mac runs (found 2026-10-31).** The MLX trainer's LR schedule ran at 0.1× for the first 60% of every Mac run: `mlx.optimizers` keeps the step as uint64, so `step - cooldown_start` wrapped around. It is fixed in `mlx_mac/train_mlx.py`, and `--schedule mlx_bug` reproduces the old runs. `common/config.py` now has a shared `lr_mult(step, n, mode)`. The TPU and B300 grids use the intended schedule. The Mac grid will be re-run.
+
 > ⚠️ **Work in progress.** The Mac (MLX, simulated formats) results are in. The TPU (Colab) and B300 (real NVFP4) runs are pending, and the JAX and PyTorch trainers are still being smoke-tested.
 
 ## The question
@@ -21,7 +23,7 @@
 | Platform | Code | Formats | Status |
 |---|---|---|---|
 | Mac (Apple Silicon, MLX) | `mlx_mac/` (`train_mlx.py`, `lowp.py`, `lowp_grid.py`, plus the custom Metal kernels in `eml_kernels.py`) | simulated, all formats | **done:** `mlx_mac/results/lowp_A.jsonl` |
-| Google TPU v5e / v6e (Colab) | `jax_tpu/train_jax.py` (Flax NNX + optax + Qwix) | real INT8; simulated FP8 / FP4 | being fixed and smoke-tested; Colab notebook coming |
+| Google TPU v5e / v6e (Colab) | `jax_tpu/train_jax.py` (Flax NNX + optax + Qwix), `jax_tpu/colab_tpu.ipynb` | real INT8; simulated FP8 / FP4 | **ready to run:** CPU-verified (63 arms) and matched step for step against the MLX trainer; see `jax_tpu/README_COLAB.md` |
 | NVIDIA B300 (RunPod) | `torch_b300/` (PyTorch + Transformer Engine) | real NVFP4 and MXFP8; simulated formats | being smoke-tested on H100 first |
 
 ## Repository layout

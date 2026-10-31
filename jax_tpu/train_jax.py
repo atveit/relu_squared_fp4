@@ -7,6 +7,10 @@ blocks' 2-D matrices, Adam without bias correction elsewhere), LR schedule and t
   python jax_tpu/train_jax.py --grid small                                          # the TPU grid; skips finished runs
   JAX_PLATFORMS=cpu python jax_tpu/train_jax.py --grid smoke --data-dir <dir>       # CPU smoke test: every act x recipe
 
+LR schedule: --schedule intended (default; common.config.lr_mult) or mlx_uint64_bug, an exact replica of what the Mac grids
+ran before 2026-10-31 (0.1x LR for the first 60% of each run: MLX's uint64 step wrapped around; jax_tpu/LEARNINGS.md).
+Parity: from identical weights this trainer matches mlx_mac/train_mlx.py step for step (every activation, every sim format).
+
 Recipes (the format applies to the blocks' hidden Linears qkv, o, fc, proj; embedding, norms, activations, residual stream
 and optimizer are fp32 in every recipe):
   fp32     fp32 GEMMs everywhere, with precision HIGHEST so a TPU doesn't round fp32 operands to bf16. = the Mac's baseline
@@ -41,7 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 from common.config import (ACTIVATIONS, ADAM, CONFIGS, DEFAULT_LR_MULT, HEAD_STD, MUON, NORM_EPS, ROPE_BASE,  # noqa: E402
-                           SCHEDULE, SIM_RECIPES, SOFTCAP, VAL_TOKENS, XIELU, hidden_for)
+                           SCHEDULE_MODES, SIM_RECIPES, SOFTCAP, VAL_TOKENS, XIELU, hidden_for, lr_mult)
 from common import data as D  # noqa: E402
 
 F32, BF16 = jnp.float32, jnp.bfloat16
@@ -295,10 +299,11 @@ def xent(logits, y):
 
 
 # ----------------------------------------------------------------------------------------------- optimizer (MLX semantics)
-def lr_schedule(base, n):
-    """Constant, then linear decay to floor * base over the last cooldown_frac of the run (train_mlx.lr_schedule)."""
-    cd = int(n * (1 - SCHEDULE["cooldown_frac"]))
-    return lambda step: base * (1.0 - (1.0 - SCHEDULE["floor"]) * jnp.clip((step - cd) / max(1, n - cd), 0.0, 1.0))
+def lr_schedule(base, n, mode="intended"):
+    """step -> LR, from common.config.lr_mult (a lookup table, so every trainer uses the same numbers). mode
+    "mlx_uint64_bug" replicates the Mac grids run before 2026-10-31 (0.1x LR until the cooldown; jax_tpu/LEARNINGS.md)."""
+    table = jnp.asarray([base * lr_mult(s, n, mode) for s in range(n)], F32)
+    return lambda step: table[jnp.clip(step, 0, n - 1)]
 
 
 def newton_schulz(G):
@@ -357,9 +362,10 @@ def label_params(params):
         lambda path, x: "muon" if (path[0].key == "blocks" and x.ndim == 2) else "adam", params)
 
 
-def make_tx(params, n, lr_mult):
-    return optax.multi_transform({"muon": muon(lr_schedule(MUON["lr"] * lr_mult, n)),
-                                  "adam": adam_nobc(lr_schedule(ADAM["lr"] * lr_mult, n))}, label_params(params))
+def make_tx(params, n, mult, schedule="intended"):
+    return optax.multi_transform({"muon": muon(lr_schedule(MUON["lr"] * mult, n, schedule)),
+                                  "adam": adam_nobc(lr_schedule(ADAM["lr"] * mult, n, schedule))},
+                                 label_params(params))
 
 
 # ----------------------------------------------------------------------------------------------- training
@@ -452,7 +458,7 @@ def run(args):
     model, _ = build_model(cfg, args.act, args.recipe, args.seed, remat)
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
     params = nnx.to_pure_dict(params)
-    tx = make_tx(params, args.steps, args.lr_mult)
+    tx = make_tx(params, args.steps, args.lr_mult, args.schedule)
     opt_state = tx.init(params)
     train_step, eval_step = make_fns(graphdef, args.recipe, tx, accum)
     base_key = jax.random.key(1000 + args.seed)
@@ -481,6 +487,7 @@ def run(args):
     rec = dict(platform=args.platform or jax.default_backend(), framework="jax", device=getattr(dev, "device_kind", str(dev)),
                device_tag=device_tag(), n_devices=jax.device_count(), act=args.act, recipe=args.recipe, hp=hp_of(args.recipe),
                seed=args.seed, n=args.steps, config=args.config, cfg=cfg, accum=accum, remat=remat, lr_mult=args.lr_mult,
+               schedule=args.schedule,
                val_loss=v, val_tokens=len(vals) * 16 * T, step_ms=round(1000 * train_s / nsteps, 2),
                first_step_s=round(t_first, 2), eval_s=round(t_eval, 2), tokens_per_s=round(nsteps * B * T / max(train_s, 1e-9)), losses=losses,
                params=sum(int(np.prod(p.shape)) for p in jax.tree.leaves(params)),
@@ -514,6 +521,10 @@ GRIDS = {
     # Mac's baseline (pair the sim_* arms with it); bf16 is the TPU-native baseline (pair int8 with it).
     "small": dict(config="tiny", steps=600, seeds=[1, 2], acts=list(ACTIVATIONS),
                   recipes=["fp32", "bf16", "int8", "sim_fp8", "sim_int8", "sim_nvfp4", "sim_nvfp4h", "sim_mxfp4"]),
+    # Cross-check with the Mac grid as it ran (mlx_mac/results/lowp_A.jsonl, made before the LR-schedule fix): the same
+    # arms with the MLX uint64 schedule bug replicated. fp32 has the Mac's exact semantics; bf16 is the TPU baseline.
+    "xcheck": dict(config="tiny", steps=600, seeds=[1, 2], acts=["relu2", "lrelu2"], recipes=["fp32", "bf16", "sim_nvfp4"],
+                   schedule="mlx_uint64_bug"),
     # GPT-2-small shape: simulated FP4 at a scale the Mac can't reach (per-block remat; --accum on a 16 GB v5e).
     "scale": dict(config="gpt2s", steps=2000, seeds=[1], acts=["relu2", "lrelu2", "swiglu", "eglu_r2n"],
                   recipes=["bf16", "int8", "fp32", "sim_nvfp4", "sim_nvfp4h"]),
@@ -532,6 +543,9 @@ def parser():
     ap.add_argument("--accum", type=int, default=0, help="micro-batches per step (same math, less memory; 0 = 1)")
     ap.add_argument("--remat", type=int, default=None, help="per-block rematerialization 0/1 (default: on except tiny)")
     ap.add_argument("--lr-mult", type=float, default=DEFAULT_LR_MULT)
+    ap.add_argument("--schedule", default="intended", choices=SCHEDULE_MODES,
+                    help="intended = common.config.lr_mult; mlx_uint64_bug = what the Mac grids ran before 2026-10-31 "
+                         "(0.1x LR until the cooldown), to compare with those results")
     ap.add_argument("--data-dir", default=os.environ.get("FP4_DATA", os.path.join(ROOT, "data")))
     ap.add_argument("--out", default=None, help="jsonl to append to (default results/jax_runs.jsonl, or "
                                                 "results/jax_<grid>.jsonl with --grid)")
@@ -563,22 +577,23 @@ def main():
     recipes = args.recipes.split(",") if args.recipes else g["recipes"]
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else g["seeds"]
     steps = g["steps"] if args.steps == parser().get_default("steps") else args.steps
+    schedule = g.get("schedule", args.schedule)
     dev = getattr(jax.devices()[0], "device_kind", jax.default_backend())
     done = set()
     if os.path.exists(out):   # done per device kind, so one file can hold a v5e and a v6e pass
         for line in open(out):
             try:
                 r = json.loads(line)
-                done.add((r["act"], r["recipe"], r["seed"], r["n"], r["config"], r.get("device")))
+                done.add((r["act"], r["recipe"], r["seed"], r["n"], r["config"], r.get("device"), r.get("schedule")))
             except (json.JSONDecodeError, KeyError):
                 pass
     jobs = [(a, r, s) for s in seeds for r in recipes for a in acts
-            if (a, r, s, steps, g["config"], dev) not in done]
-    print(f"grid {args.grid} on {dev}: {len(jobs)} runs to do ({len(done)} records already in {out})", flush=True)
+            if (a, r, s, steps, g["config"], dev, schedule) not in done]
+    print(f"grid {args.grid} ({schedule} LR schedule) on {dev}: {len(jobs)} runs to do ({len(done)} records already in {out})", flush=True)
     failed = []
     for act, recipe, seed in jobs:
         argv = ["--act", act, "--recipe", recipe, "--seed", str(seed), "--steps", str(steps), "--config", g["config"],
-                "--out", out, "--data-dir", args.data_dir, "--lr-mult", str(args.lr_mult), "--log-every", str(args.log_every),
+                "--out", out, "--data-dir", args.data_dir, "--lr-mult", str(args.lr_mult), "--schedule", schedule, "--log-every", str(args.log_every),
                 "--val-tokens", str(g.get("val_tokens", args.val_tokens)), "--cache-dir", ""]
         if args.batch or g.get("batch"):
             argv += ["--batch", str(args.batch or g["batch"])]

@@ -29,6 +29,10 @@ PACKED = {"swiglu", "s2glu_r2", "eglu_r2n", "eml"}
 MUON = dict(lr=0.02, momentum=0.95, nesterov=True, ns_coeffs=(3.4445, -4.7750, 2.0315), ns_steps=5)
 ADAM = dict(lr=0.008, b1=0.9, b2=0.95, eps=1e-8)
 SCHEDULE = dict(cooldown_frac=0.4, floor=0.1)   # constant, then linear decay over the last 40% to 0.1x
+# "intended" = the schedule above. "mlx_uint64_bug" = what the Mac grids ran before 2026-10-31: mlx.optimizers keeps the
+# step as uint64, so train_mlx.lr_schedule's (step - cd) wrapped around below cd and the LR sat at floor x base (0.1x)
+# for the first 60% of every run, jumped to 1x at step cd, then decayed to 0.1x (see jax_tpu/LEARNINGS.md).
+SCHEDULE_MODES = ("intended", "mlx_uint64_bug")
 SOFTCAP = 15.0
 HEAD_STD = 0.005
 NORM_EPS = 1e-6
@@ -52,10 +56,18 @@ def hidden_for(act: str, d: int) -> tuple[int, int]:
     return 4 * d, 4 * d
 
 
-def lr_at(step: int, n: int, base: float) -> float:
+def lr_mult(step: int, n: int, mode: str = "intended") -> float:
+    """LR multiplier at the 0-based optimizer step `step` of an n-step run (shared by every trainer)."""
+    assert mode in SCHEDULE_MODES, mode
     cd = int(n * (1 - SCHEDULE["cooldown_frac"]))
+    if mode == "mlx_uint64_bug" and step < cd:
+        return SCHEDULE["floor"]
     t = min(max((step - cd) / max(1, n - cd), 0.0), 1.0)
-    return base * (1.0 - (1.0 - SCHEDULE["floor"]) * t)
+    return 1.0 - (1.0 - SCHEDULE["floor"]) * t
+
+
+def lr_at(step: int, n: int, base: float, mode: str = "intended") -> float:
+    return base * lr_mult(step, n, mode)
 
 
 # Number-format recipes. "sim_*" = fake quantization with the same numerics on any device (ports of

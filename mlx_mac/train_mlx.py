@@ -154,11 +154,21 @@ def loss_fn(model, x, y):
     return nn.losses.cross_entropy(logits, y, reduction="mean")
 
 
-def lr_schedule(base, n, cooldown_frac=0.4, floor=0.1):
+# "intended" (constant, then linear decay to floor over the last cooldown_frac) or "mlx_bug": the schedule every run
+# before 2026-10-31 actually got. mlx.optimizers passes `step` as a uint64 array, so `step - cd` wrapped around below cd,
+# t clipped to 1 and the LR sat at floor x base (0.1x) for the first 60% of the run, then jumped to 1x at step cd and
+# decayed to 0.1x (= common.config.lr_mult(..., "mlx_uint64_bug")). Set by --schedule; stored in every result.
+SCHEDULE_MODE = "intended"
+
+
+def lr_schedule(base, n, cooldown_frac=0.4, floor=0.1, mode=None):
     cd = int(n * (1 - cooldown_frac))
+    mode = mode or SCHEDULE_MODE
+    assert mode in ("intended", "mlx_bug"), mode
 
     def f(step):
-        t = mx.clip((step - cd) / max(1, n - cd), 0.0, 1.0)
+        s = step if mode == "mlx_bug" else mx.array(step).astype(mx.float32)   # the fix: signed arithmetic
+        t = mx.clip((s - cd) / max(1, n - cd), 0.0, 1.0)
         return base * (1.0 - (1.0 - floor) * t)
     return f
 
@@ -243,7 +253,7 @@ def run(arm, seed, n, args, train, val):
     train_s = time.perf_counter() - t0
     vl = evaluate(model, val, 16, args.seq)
     nparams = sum(v.size for _, v in tree_flatten(model.parameters()))
-    return dict(arm=arm, seed=seed, n=n, val_loss=vl, step_ms=round(1000 * train_s / max(1, n - 1), 2),
+    return dict(arm=arm, seed=seed, n=n, schedule=SCHEDULE_MODE, val_loss=vl, step_ms=round(1000 * train_s / max(1, n - 1), 2),
                 first_step_s=round(t_first, 2), tokens_per_s=round((n - 1) * args.batch * args.seq / train_s),
                 params=nparams, losses=losses, cfg=dict(d=args.d, layers=args.layers, batch=args.batch, seq=args.seq))
 
@@ -339,7 +349,11 @@ def main():
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--val-tokens", type=int, default=1 << 19)
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--schedule", default="intended", choices=["intended", "mlx_bug"],
+                    help="mlx_bug reproduces the runs made before 2026-10-31 (0.1x LR until the cooldown)")
     args = ap.parse_args()
+    global SCHEDULE_MODE
+    SCHEDULE_MODE = args.schedule
     ns, seeds, arms = parse_list(args.ns), parse_list(args.seeds), args.arms.split(",")
     need = max(ns + [120]) * args.batch * args.seq + 1
     train = tokens(f"{DATA}/fineweb_train_000001.bin", need)
@@ -351,7 +365,8 @@ def main():
     out = os.path.join(HERE, "results", f"{args.tag}.jsonl")
     done = set()
     if os.path.exists(out):
-        done = {(r["arm"], r["seed"], r["n"]) for r in map(json.loads, open(out))}
+        done = {(r["arm"], r["seed"], r["n"]) for r in map(json.loads, open(out))
+                if r.get("schedule", "mlx_bug") == SCHEDULE_MODE}   # records without the field predate the fix
     for n in ns:
         for seed in seeds:
             for arm in arms:
