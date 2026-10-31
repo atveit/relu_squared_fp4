@@ -30,7 +30,7 @@ import torch.nn.functional as F
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-from common.config import ADAM, CONFIGS, DEFAULT_LR_MULT, MUON, SIM_RECIPES, lr_at  # noqa: E402
+from common.config import ADAM, CONFIGS, DEFAULT_LR_MULT, MUON, SCHEDULE_MODES, SIM_RECIPES, lr_at  # noqa: E402
 from common import data as D  # noqa: E402
 from model import GPT, hidden_matrices, init_weights  # noqa: E402
 from optim import MuonAdam  # noqa: E402
@@ -59,7 +59,16 @@ def make_linear_factory(recipe):
         return lambda i, o: SimLinear(i, o, SIM_RECIPES[recipe])
     if recipe in TE_RECIPES:
         import transformer_engine.pytorch as te
-        return lambda i, o: te.Linear(i, o, bias=False, params_dtype=torch.float32)
+
+        class TELinear(te.Linear):
+            """te.Linear fed bf16 activations, like the bf16 baseline's nn.Linear under autocast. TE quantizes its input
+            in the dtype it arrives in (our residual stream is fp32), and NVFP4's Hadamard kernel only accepts bf16
+            ("RHT is only supported for bfloat16 input"), so every TE recipe gets the same bf16 input."""
+
+            def forward(self, inp, *a, **k):
+                return super().forward(inp.to(torch.bfloat16) if inp.is_cuda else inp, *a, **k)
+
+        return lambda i, o: TELinear(i, o, bias=False, params_dtype=torch.float32)
     return lambda i, o: nn.Linear(i, o, bias=False)
 
 
@@ -106,7 +115,7 @@ def run(args):
         ok = te.is_nvfp4_available() if args.recipe.startswith("nvfp4") else (
             te.is_mxfp8_available() if args.recipe == "mxfp8" else te.is_fp8_available())
         if not ok:
-            raise SystemExit(f"recipe {args.recipe} is not available on this GPU / Transformer Engine build")
+            raise RuntimeError(f"recipe {args.recipe} is not available on this GPU / Transformer Engine build")
     torch.manual_seed(args.seed)
     model = GPT(cfg, args.act, make_linear_factory(args.recipe))
     init_weights(model, args.seed)
@@ -127,7 +136,8 @@ def run(args):
             logits = model(x)
         loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1).long())
         loss.backward()
-        opt.step(lr_at(s, args.steps, MUON["lr"] * args.lr_mult), lr_at(s, args.steps, ADAM["lr"] * args.lr_mult))
+        opt.step(lr_at(s, args.steps, MUON["lr"] * args.lr_mult, args.schedule),
+                 lr_at(s, args.steps, ADAM["lr"] * args.lr_mult, args.schedule))
         opt.zero_grad()
         if s == 0:
             if device.type == "cuda":
@@ -143,9 +153,9 @@ def run(args):
     train_s = time.perf_counter() - t0
     v = evaluate(model, val, T, device, prec, quantize=True)
     v_hp = evaluate(model, val, T, device, prec, quantize=False) if args.recipe in TE_RECIPES else v
-    rec = dict(platform=args.platform, framework="torch", device=torch.cuda.get_device_name() if device.type == "cuda"
+    rec = dict(run_id=run_id(args), platform=args.platform, framework="torch", device=torch.cuda.get_device_name() if device.type == "cuda"
                else platform.processor() or device.type, act=args.act, recipe=args.recipe, seed=args.seed, n=args.steps,
-               config=args.config, cfg=cfg, lr_mult=args.lr_mult, val_loss=v, val_loss_hp_eval=v_hp,
+               config=args.config, cfg=cfg, lr_mult=args.lr_mult, lr_schedule=args.schedule, val_loss=v, val_loss_hp_eval=v_hp,
                step_ms=round(1000 * train_s / max(1, args.steps - 1), 2), first_step_s=round(t_first or 0, 2),
                tokens_per_s=round((args.steps - 1) * B * T / train_s), losses=losses,
                params=sum(p.numel() for p in model.parameters()), torch=torch.__version__,
@@ -167,6 +177,50 @@ def _te_version():
         return None
 
 
+def run_id(args):
+    return (f"{args.config}_{args.act}_{args.recipe}_s{args.seed}_n{args.steps}"
+            + (f"_lr{args.lr_mult:g}" if args.lr_mult != 1.0 else "")
+            + (f"_{args.schedule}" if args.schedule != "intended" else ""))
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
+def run_logged(args, log_dir, prefix=""):
+    """run(args) with its full stdout / stderr and settings in <log_dir>/<prefix><run_id>.log; returns the record, or
+    None on an exception (the traceback goes to the log; the caller decides whether to continue)."""
+    import traceback
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, prefix + run_id(args) + ".log")
+    with open(path, "a") as fh:
+        old = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = _Tee(old[0], fh), _Tee(old[1], fh)
+        try:
+            print(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} run {run_id(args)}\nargs {json.dumps(vars(args))}\n"
+                  f"torch {torch.__version__} cuda {torch.version.cuda} te {_te_version()} "
+                  f"device {torch.cuda.get_device_name() if torch.cuda.is_available() else 'cpu'}", flush=True)
+            rec = run(args)
+            print(f"=== record {json.dumps(rec)}", flush=True)
+            return rec
+        except Exception:
+            print(f"=== FAILED\n{traceback.format_exc()}", flush=True)
+            return None
+        finally:
+            sys.stdout.flush(), sys.stderr.flush()
+            sys.stdout, sys.stderr = old
+
+
 def parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--act", default="relu2")
@@ -177,15 +231,20 @@ def parser():
     ap.add_argument("--val-tokens", type=int, default=1 << 19, help="smaller for smoke tests")
     ap.add_argument("--batch", type=int, default=0, help="override the config's batch (smoke tests)")
     ap.add_argument("--lr-mult", type=float, default=DEFAULT_LR_MULT)
+    ap.add_argument("--schedule", default="intended", choices=SCHEDULE_MODES,
+                    help="common.config.lr_mult mode; 'intended' unless reproducing the Mac grids' uint64 bug")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--data-dir", default=os.environ.get("FP4_DATA", os.path.join(os.path.dirname(HERE), "data")))
     ap.add_argument("--out", default=os.path.join(os.path.dirname(HERE), "results", "torch_runs.jsonl"))
     ap.add_argument("--platform", default=os.environ.get("FP4_PLATFORM", "b300"))
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--log-dir", default=None, help="also write the run's full output + settings to <dir>/<run_id>.log")
     return ap
 
 
 if __name__ == "__main__":
     a = parser().parse_args()
     D.ensure_data(a.data_dir)
+    if a.log_dir:
+        sys.exit(0 if run_logged(a, a.log_dir) is not None else 1)
     run(a)
