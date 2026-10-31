@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--plan", default="tiny_core", choices=list(PLANS))
     ap.add_argument("--lr-mult", type=float, default=None)
     ap.add_argument("--steps", type=int, default=None, help="override the plan's steps")
-    ap.add_argument("--out", default=None, help="default: ../results/torch_b300_<plan>.jsonl")
+    ap.add_argument("--out", default=None, help="default: ../results/torch_b300/torch_b300_<plan>.jsonl (resumes from it)")
     ap.add_argument("--log-dir", default=None, help="one <plan>_<run_id>.log per run (full output + settings)")
     ap.add_argument("--max-minutes", type=float, default=None, help="do not start a new run after this many minutes")
     ap.add_argument("--seeds", default=None, help="override, e.g. 1 or 1,2")
@@ -63,7 +63,7 @@ def main():
         if getattr(g, k):
             plan[k] = getattr(g, k).split(",")
     base = TR.parser().parse_args([])
-    out = g.out or os.path.join(os.path.dirname(HERE), "results", f"torch_b300_{g.plan}.jsonl")
+    out = g.out or os.path.join(os.path.dirname(HERE), "results", "torch_b300", f"torch_b300_{g.plan}.jsonl")
     done = set()
     if os.path.exists(out):
         done = {(r["act"], r["recipe"], r["seed"], r["n"]) for r in map(json.loads, open(out))}

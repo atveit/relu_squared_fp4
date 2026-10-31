@@ -83,13 +83,22 @@ lane() {   # lane <name> <plan[:seeds]>...  : runs the plans one after another, 
     say "lane $name: $spec (max $left min)"
     python grid.py --plan $plan $seeds --max-minutes $left --out "$RES/torch_b300_$plan.jsonl" --log-dir "$LOGS" \
       >> "$LOGS/grid_lane_$name.log" 2>&1
-    say "lane $name: $spec exit $?"
+    local rc=$?
+    say "lane $name: $spec exit $rc"
+    # Killed (SIGTERM / SIGKILL: rc >= 128) means "stop", not "plan finished": do not start the lane's next plan.
+    [ $rc -ge 128 ] && { say "lane $name: grid.py was killed, stopping the lane"; break; }
   done
 }
 
 grid() {
-  # The tiny model is launch-bound on the B300's E-core host CPU, so 3 processes share the GPU (per-process step time
-  # barely changes with 2; ~+25% with 3). Seed-major lanes: a cut-short grid still has every arm at seed 1.
+  # The tiny model is launch-bound on the B300's E-core host CPU, so 3 processes share the GPU (per-process tiny step
+  # time barely changes with 2, ~+25% with 3; the GPU-bound gpt2s lane runs ~2.3x slower next to two tiny lanes).
+  # Seed-major lanes: a cut-short grid still has every arm at seed 1.
+  # Resume: grid.py skips every (act, recipe, seed, n) already in its results file, so seed $RES with the records that
+  # are already in the repo (results/torch_b300/, committed after each session).
+  for f in "$REPO"/results/torch_b300/torch_b300_{tiny_core,tiny_match,tiny_more,scale}.jsonl; do
+    if [ -f "$f" ] && [ ! -f "$RES/$(basename "$f")" ]; then cp "$f" "$RES/"; say "resume: $(wc -l < "$f") records from $f"; fi
+  done
   DEADLINE=$(( $(date +%s) + GRID_MINUTES * 60 ))
   say "grid: 3 lanes, deadline in $GRID_MINUTES min"
   lane A tiny_core:1 tiny_match:1 tiny_more:1 &

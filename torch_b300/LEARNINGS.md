@@ -77,4 +77,17 @@ No other semantic deviations were found against `common/config.py` / the MLX ref
 
 ## Grid run on the B300 (pod 2ego4dckx8oek6, billing from 15:41)
 - **Smoke 15:50–15:56:** 42/42 OK (3 activations × 14 recipes, 20 steps). Records are in `results/torch_b300/torch_b300_smoke.jsonl`, logs in `logs/smoke_*.log`.
-- **Grid from 16:01, three lanes:** `tiny_core` seed 1, `tiny_core` seed 2, and `scale` (gpt2s, 1000 steps). Then `tiny_more` seeds 1 and 2 under a time cap.
+  - The smoke records predate the `lr_schedule` field, but they used the same intended `lr_at`.
+  - The first attempt (fp32 input to TE, E33) is kept in `logs/attempt1_fp32_input/`.
+- **Grid from 16:01, three lanes:** `tiny_core` seed 1, `tiny_core` seed 2, and `scale` (gpt2s, 1000 steps). Chained after the tiny lanes: `tiny_match`, then `tiny_more`, with no new run after 16:58.
+- **16:16–16:20 PAUSED** (Amund's call: focus on the 8× experiment). The coordinator killed the grid and stopped the pod.
+  - Done: tiny_core 24/42, scale 1/9.
+  - Killed mid-run, logs only: scale lrelu2 bf16, and tiny_match relu2 nvfp4_1d s1 / s2, which the chain started when the tiny lanes died.
+  - At 16:16:52 I had also started a runbook `setup` test in `/root/rb_test`. I stopped it at 16:17:06, before it reached the GPU, and deleted the directory.
+  - Final pull 16:17:34: pod 102 log files + 3 jsonl. On the Mac: the same 102, plus 4 copies of top-level pod files in `logs/env/`; the jsonl md5s match.
+- **Lesson:** a chain that waits on a lane's PID must also check *why* the lane ended. When the lanes were killed, `chain_more.sh` took that as "finished" and started the next plan. In `run_b300.sh`, a lane stops when grid.py exits with rc ≥ 128 (killed); grid.py itself exits 0 after a normal plan, even with failed runs.
+- **First results:** see README_B300.md.
+  - Real NVFP4 costs relu2 / lrelu2 / swiglu about the same, +30–40 mnat at N = 600.
+  - The Hadamard does not help at this horizon. bare ≤ default.
+  - LeakyReLU² is best in every recipe. ReLU² gets no FP4 advantage.
+  - The gpt2s bf16 relu2 baseline at N = 1000 is 4.4812.
